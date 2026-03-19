@@ -23,7 +23,9 @@ jobs:
           cache: npm
 
       - name: Remove Windows junction points
-        run: cmd /c "rmdir /s /q C:\Users\runneradmin\Application Data" 2>nul & exit /b 0
+        run: |
+          for /f "delims=" %%i in ('dir /al /b C:\Users\runneradmin 2^>nul') do rmdir "C:\Users\runneradmin\%%i" 2>nul
+          exit /b 0
         shell: cmd
 
       - name: Install dependencies
