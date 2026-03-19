@@ -2,8 +2,44 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { execSync } from "child_process";
+import { existsSync } from "fs";
 import type { StreamEvent } from "@/types/chat";
 import type { McpServerConfig } from "@/types/chat";
+
+/**
+ * Resolve the system-installed Claude Code CLI executable path.
+ * In Electron builds, the SDK incorrectly resolves to a bundled path,
+ * so we need to explicitly find the system-installed binary.
+ */
+function resolveClaudeCliPath(): string | undefined {
+  // Common install locations on Windows
+  const homeDir = process.env.USERPROFILE || process.env.HOME || "";
+  const candidates = [
+    join(homeDir, ".local", "bin", "claude.exe"),
+    join(homeDir, ".local", "bin", "claude"),
+    join(homeDir, "AppData", "Roaming", "npm", "claude.cmd"),
+    join(homeDir, "AppData", "Roaming", "npm", "claude"),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  // Fallback: try `where` / `which`
+  try {
+    const result = execSync(
+      process.platform === "win32" ? "where claude" : "which claude",
+      { encoding: "utf-8", timeout: 3000 }
+    ).trim().split("\n")[0];
+    if (result && existsSync(result)) {
+      return result;
+    }
+  } catch { /* not found */ }
+
+  return undefined;
+}
 
 // Track Claude CLI subprocess PIDs for forceful cleanup on abort
 const activeAgentPids = new Map<AbortSignal, Set<number>>();
@@ -215,6 +251,13 @@ export async function* runAgent(
         if (match) preExistingPids.add(parseInt(match[1], 10));
       }
     } catch { /* ignore */ }
+
+    // Resolve system-installed Claude CLI path (needed for Electron builds)
+    const cliPath = resolveClaudeCliPath();
+    if (cliPath) {
+      options.pathToClaudeCodeExecutable = cliPath;
+      console.log(`[agent] Using Claude CLI at: ${cliPath}`);
+    }
 
     // Use manual iteration with Promise.race for immediate abort response
     // (for await...of blocks until next SDK message, making abort checks delayed)
