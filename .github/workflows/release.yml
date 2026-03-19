@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Build Electron (Windows)
+        run: npx electron-builder --win --config electron-builder.config.js
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-electron/*.exe
+          body: |
+            ## Claude Agent Chat ${{ github.ref_name }}
+
+            ### 설치 방법
+            1. 아래 `.exe` 파일을 다운로드합니다.
+            2. 실행하여 설치합니다.
+            3. [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) 인증이 필요합니다.
+
+            ### Prerequisites
+            - [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) authenticated
+          draft: false
+          prerelease: false
