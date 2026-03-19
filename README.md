@@ -12,13 +12,24 @@ Built on Anthropic's [Claude Agent SDK](https://www.npmjs.com/package/@anthropic
 
 ## Why?
 
-| claude.ai | Claude Agent Chat |
-|-----------|-------------------|
-| Chat only | Chat + file explorer + built-in terminal |
-| No file access | Reads & writes files on your machine |
-| No terminal | Runs commands directly |
-| Single conversation | Multi-window (KakaoTalk-style) |
-| Browser tab | Desktop app with system tray |
+I was using Claude Code in the terminal daily, but kept hitting the same friction — no easy copy-paste, no image attachments, no visual feedback.
+
+Claude Desktop (claude.ai) solved some of that with its Code tab, but it shares infrastructure with the web app — when claude.ai goes down, Desktop goes down with it.
+
+Then I discovered the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk). Since it talks directly to the API, it doesn't depend on claude.ai's availability. I started with a browser prototype, then moved to Electron for a more minimal, native feel.
+
+For the UX, I borrowed from **KakaoTalk** — a chat list on the left, pop-out windows for each conversation, unread badges, system tray. It turns out a messaging app is a surprisingly good shell for an AI coding agent.
+
+|  | Claude Code (Terminal) | Claude Desktop | Claude Agent Chat |
+|--|----------------------|----------------|-------------------|
+| File read/write | ✅ | ✅ (Code tab) | ✅ |
+| Terminal commands | ✅ | ✅ (Code tab) | ✅ |
+| Copy & paste | ❌ Awkward in terminal | ✅ | ✅ |
+| Image attachments | ❌ | ✅ | ✅ |
+| Works when claude.ai is down | ✅ | ❌ Goes down together | ✅ |
+| Multi-conversation | ❌ | Single thread | Multi-window (KakaoTalk-style) |
+| Background tasks | ❌ Blocks terminal | ❌ | ✅ System tray + unread badges |
+| Desktop app | Terminal only | Electron app | Electron app |
 
 ## Features
 
