@@ -17,6 +17,7 @@ import type {
 import {
   loadChats,
   saveChats,
+  saveSingleChat,
   createChat,
   deleteChat as deleteChatFromList,
   addMessageToChat,
@@ -383,13 +384,20 @@ function HomeInner() {
   const quotaWarned = useRef(false);
   useEffect(() => {
     if (chats.length > 0) {
-      const ok = saveChats(chats);
+      let ok: boolean;
+      if (windowMode === "chat" && windowChatId) {
+        // Chat windows: merge-save only their own chat to avoid overwriting other chats
+        ok = saveSingleChat(windowChatId, chats);
+      } else {
+        // Main window: save the full list
+        ok = saveChats(chats);
+      }
       if (!ok && !quotaWarned.current) {
         quotaWarned.current = true;
         addToast("warning", "Storage almost full. Some data may not be saved. Consider exporting and clearing old chats.");
       }
     }
-  }, [chats, addToast]);
+  }, [chats, addToast, windowMode, windowChatId]);
 
   // Get active chat + derived model/cwd
   const activeChat = chats.find((c) => c.id === activeChatId) || null;
@@ -1408,6 +1416,7 @@ function HomeInner() {
   }, [windowMode, activeChat?.title]);
 
   // Cross-window sync via storage events
+  const lastStorageSnapshotRef = useRef<string>("");
   useEffect(() => {
     const handler = (e: StorageEvent) => {
       // Sync theme/appSettings across all windows
@@ -1418,7 +1427,11 @@ function HomeInner() {
       }
       // Sync chat list for main window
       if (e.key === "claude-agent-chats" && windowMode === "main") {
-        setChats(loadChats());
+        const raw = e.newValue || "";
+        if (raw !== lastStorageSnapshotRef.current) {
+          lastStorageSnapshotRef.current = raw;
+          setChats(loadChats());
+        }
       }
     };
     window.addEventListener("storage", handler);
@@ -1426,7 +1439,11 @@ function HomeInner() {
     let interval: ReturnType<typeof setInterval> | undefined;
     if (windowMode === "main") {
       interval = setInterval(() => {
-        setChats(loadChats());
+        const raw = localStorage.getItem("claude-agent-chats") || "";
+        if (raw !== lastStorageSnapshotRef.current) {
+          lastStorageSnapshotRef.current = raw;
+          setChats(loadChats());
+        }
       }, 3000);
     }
     return () => {

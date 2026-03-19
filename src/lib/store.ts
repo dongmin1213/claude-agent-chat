@@ -71,6 +71,35 @@ export function saveChats(chats: Chat[]): boolean {
   }
 }
 
+/**
+ * Merge-save a single chat into localStorage without overwriting other chats.
+ * Used by chat windows to avoid race conditions with the main window.
+ */
+export function saveSingleChat(chatId: string, chats: Chat[]): boolean {
+  if (typeof window === "undefined") return true;
+  const updatedChat = chats.find((c) => c.id === chatId);
+  if (!updatedChat) return true;
+
+  try {
+    // Read the CURRENT full list from localStorage (not our stale state)
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const current: Chat[] = raw ? JSON.parse(raw) : [];
+
+    // Replace only the target chat, keep everything else as-is
+    const idx = current.findIndex((c) => c.id === chatId);
+    if (idx >= 0) {
+      current[idx] = updatedChat;
+    } else {
+      current.push(updatedChat);
+    }
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function loadAppSettings(): AppSettings {
   if (typeof window === "undefined") {
     return { ...DEFAULT_APP_SETTINGS };
