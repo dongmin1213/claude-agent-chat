@@ -22,12 +22,6 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Remove Windows junction points
-        run: |
-          for /f "delims=" %%i in ('dir /al /b C:\Users\runneradmin 2^>nul') do rmdir "C:\Users\runneradmin\%%i" 2>nul
-          exit /b 0
-        shell: cmd
-
       - name: Install dependencies
         run: npm ci
 
@@ -36,6 +30,10 @@ jobs:
 
       - name: Build Next.js
         run: npm run build
+        env:
+          # Redirect USERPROFILE so webpack doesn't scan the real user home,
+          # which contains junction points that cause EPERM errors on Windows CI
+          USERPROFILE: ${{ github.workspace }}
 
       - name: Build Electron (Windows)
         run: npx electron-builder --win --config electron-builder.config.js
