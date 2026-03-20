@@ -421,12 +421,31 @@ function createChatWindow(chatId) {
     }
   });
 
-  // Hide to tray instead of closing (keeps renderer alive for background AI)
+  // Smart close: hide if AI is streaming, destroy if idle (saves memory)
   chatWin.on("close", (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
-      chatWin.hide();
-    }
+    if (isQuitting) return; // Let it close normally during app quit
+
+    e.preventDefault();
+
+    // Ask renderer if AI is currently streaming
+    chatWin.webContents.executeJavaScript(
+      `document.querySelector('[data-streaming]')?.dataset.streaming === 'true'`
+    ).then((isStreaming) => {
+      if (isStreaming) {
+        // AI is running — hide to keep it alive
+        console.log(`[electron] Chat ${chatId} is streaming — hiding (keeping alive)`);
+        chatWin.hide();
+      } else {
+        // Idle — destroy to free memory
+        console.log(`[electron] Chat ${chatId} is idle — destroying to free memory`);
+        chatWindows.delete(chatId);
+        chatWin.destroy();
+      }
+    }).catch(() => {
+      // If check fails, safe default: just destroy
+      chatWindows.delete(chatId);
+      chatWin.destroy();
+    });
   });
 
   chatWin.on("closed", () => {
