@@ -289,6 +289,26 @@ function createWindow(port) {
     mainWindow.webContents.send("maximize-change", false);
   });
 
+  // Auto-recover from renderer crash
+  mainWindow.webContents.on("render-process-gone", (event, details) => {
+    console.log(`[electron] Main window renderer gone (reason: ${details.reason})`);
+    if (details.reason === "crashed" || details.reason === "oom" || details.reason === "killed") {
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          console.log(`[electron] Reloading main window`);
+          mainWindow.loadURL(`http://127.0.0.1:${serverPort}?mode=main`);
+        }
+      }, 1000);
+    }
+  });
+
+  mainWindow.on("unresponsive", () => {
+    console.log(`[electron] Main window unresponsive — reloading`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.reload();
+    }
+  });
+
   // Hide to tray instead of closing (unless quitting)
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
@@ -318,11 +338,20 @@ function createChatWindow(chatId) {
   if (chatWindows.has(chatId)) {
     const existing = chatWindows.get(chatId);
     if (existing && !existing.isDestroyed()) {
-      existing.show();
-      existing.focus();
-      return;
+      // Check if renderer is still alive — if crashed, destroy and recreate
+      if (existing.webContents.isCrashed()) {
+        console.log(`[electron] Chat window ${chatId} renderer crashed — recreating`);
+        existing.destroy();
+        chatWindows.delete(chatId);
+        // Fall through to create a new window
+      } else {
+        existing.show();
+        existing.focus();
+        return;
+      }
+    } else {
+      chatWindows.delete(chatId);
     }
-    chatWindows.delete(chatId);
   }
 
   const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
@@ -368,6 +397,28 @@ function createChatWindow(chatId) {
   });
   chatWin.on("unmaximize", () => {
     chatWin.webContents.send("maximize-change", false);
+  });
+
+  // Auto-recover from renderer crash — reload the page
+  chatWin.webContents.on("render-process-gone", (event, details) => {
+    console.log(`[electron] Chat window ${chatId} renderer gone (reason: ${details.reason})`);
+    if (details.reason === "crashed" || details.reason === "oom" || details.reason === "killed") {
+      // Wait a moment then reload — the window frame is still alive
+      setTimeout(() => {
+        if (!chatWin.isDestroyed()) {
+          console.log(`[electron] Reloading chat window ${chatId}`);
+          chatWin.loadURL(`http://127.0.0.1:${serverPort}?mode=chat&chatId=${encodeURIComponent(chatId)}`);
+        }
+      }, 1000);
+    }
+  });
+
+  // Also handle unresponsive renderer (frozen/black screen without crash)
+  chatWin.on("unresponsive", () => {
+    console.log(`[electron] Chat window ${chatId} unresponsive — reloading`);
+    if (!chatWin.isDestroyed()) {
+      chatWin.webContents.reload();
+    }
   });
 
   // Hide to tray instead of closing (keeps renderer alive for background AI)
