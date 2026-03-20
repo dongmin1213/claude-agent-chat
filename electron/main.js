@@ -11,10 +11,9 @@ const DEV_PORT = 13370; // Must match the port in electron:dev script
 const STATE_FILE = path.join(app.getPath("userData"), "window-state.json");
 
 // ── Memory optimization flags ──────────────────────────
-app.commandLine.appendSwitch("js-flags", "--max-old-space-size=256");
-app.commandLine.appendSwitch("disable-gpu-compositing");
-// Reduce renderer memory overhead
-app.commandLine.appendSwitch("disable-software-rasterizer");
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=512");
+// NOTE: Do NOT disable both gpu-compositing AND software-rasterizer —
+// that leaves no rendering backend, causing black screens on occluded windows.
 app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
 
 const ZOOM_STEP = 0.1;
@@ -298,10 +297,8 @@ function createWindow(port) {
     }
   });
 
-  // Free memory when hidden, reclaim when shown
-  mainWindow.on("hide", () => {
-    try { mainWindow.webContents.session.clearCache(); } catch {}
-  });
+  // NOTE: Do NOT clear session cache on hide — chat windows share the same
+  // session, so clearing cache here can cause black screens in other windows.
 
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -348,7 +345,7 @@ function createChatWindow(chatId) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      backgroundThrottling: true,
+      backgroundThrottling: false, // Keep rendering alive while AI streams in background
       spellcheck: false,
     },
   });

@@ -380,26 +380,55 @@ function HomeInner() {
     return () => document.removeEventListener("visibilitychange", handler);
   }, []);
 
-  // Save to localStorage when chats change
+  // Save to localStorage when chats change (debounced during streaming)
   const chatsRef = useRef(chats);
   chatsRef.current = chats;
   const quotaWarned = useRef(false);
-  useEffect(() => {
-    if (chats.length > 0) {
-      let ok: boolean;
-      if (windowMode === "chat" && windowChatId) {
-        // Chat windows: merge-save only their own chat to avoid overwriting other chats
-        ok = saveSingleChat(windowChatId, chats);
-      } else {
-        // Main window: save the full list
-        ok = saveChats(chats);
-      }
-      if (!ok && !quotaWarned.current) {
-        quotaWarned.current = true;
-        addToast("warning", "Storage almost full. Some data may not be saved. Consider exporting and clearing old chats.");
-      }
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSaveRef = useRef(false);
+
+  const doSave = useCallback(() => {
+    const currentChats = chatsRef.current;
+    if (currentChats.length === 0) return;
+    let ok: boolean;
+    if (windowMode === "chat" && windowChatId) {
+      ok = saveSingleChat(windowChatId, currentChats);
+    } else {
+      ok = saveChats(currentChats);
     }
-  }, [chats, addToast, windowMode, windowChatId]);
+    if (!ok && !quotaWarned.current) {
+      quotaWarned.current = true;
+      addToast("warning", "Storage almost full. Some data may not be saved. Consider exporting and clearing old chats.");
+    }
+    pendingSaveRef.current = false;
+  }, [addToast, windowMode, windowChatId]);
+
+  useEffect(() => {
+    if (chats.length === 0) return;
+    // If any chat is actively streaming, debounce saves (every 2s)
+    const isStreaming = loadingChatIds.size > 0;
+    if (isStreaming) {
+      if (!pendingSaveRef.current) {
+        pendingSaveRef.current = true;
+        saveTimerRef.current = setTimeout(() => {
+          doSave();
+        }, 2000);
+      }
+    } else {
+      // Not streaming: save immediately (but clear any pending timer)
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      doSave();
+    }
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [chats, doSave, loadingChatIds.size]);
 
   // Get active chat + derived model/cwd
   const activeChat = chats.find((c) => c.id === activeChatId) || null;
@@ -558,6 +587,44 @@ function HomeInner() {
   }, [chats]);
 
   // =========================================
+  // Text Delta Batching — accumulate text deltas and flush once per animation frame
+  // Prevents dozens of setChats() calls per second during streaming
+  // =========================================
+  const textDeltaBufferRef = useRef<Map<string, { chatId: string; msgId: string; text: string }>>(new Map());
+  const textDeltaRafRef = useRef<number | null>(null);
+
+  const flushTextDeltas = useCallback(() => {
+    textDeltaRafRef.current = null;
+    const buffer = textDeltaBufferRef.current;
+    if (buffer.size === 0) return;
+
+    // Collect all pending deltas
+    const entries = Array.from(buffer.entries());
+    buffer.clear();
+
+    // Apply all accumulated text deltas in a single setChats call
+    setChats((prev) => {
+      let next = prev;
+      for (const [, { chatId, msgId, text }] of entries) {
+        next = updateMessageInChat(next, chatId, msgId, (msg) => ({
+          ...msg,
+          content: (msg as AssistantTextMessage).content + text,
+        }));
+      }
+      return next;
+    });
+  }, []);
+
+  // Cleanup RAF on unmount
+  useEffect(() => {
+    return () => {
+      if (textDeltaRafRef.current !== null) {
+        cancelAnimationFrame(textDeltaRafRef.current);
+      }
+    };
+  }, []);
+
+  // =========================================
   // Stream Event Handler (per-chat, chatId captured in closure)
   // =========================================
 
@@ -603,6 +670,7 @@ function HomeInner() {
             return next;
           });
           if (!state.assistantId) {
+            // First delta: create the message immediately
             const newMsg: AssistantTextMessage = {
               id: crypto.randomUUID(),
               role: "assistant",
@@ -613,18 +681,29 @@ function HomeInner() {
             state.assistantId = newMsg.id;
             setChats((prev) => addMessageToChat(prev, chatId, newMsg));
           } else {
-            const msgId = state.assistantId;
-            setChats((prev) =>
-              updateMessageInChat(prev, chatId, msgId, (msg) => ({
-                ...msg,
-                content: (msg as AssistantTextMessage).content + event.text,
-              }))
-            );
+            // Subsequent deltas: accumulate in buffer and flush via rAF
+            const key = `${chatId}:${state.assistantId}`;
+            const existing = textDeltaBufferRef.current.get(key);
+            if (existing) {
+              existing.text += event.text;
+            } else {
+              textDeltaBufferRef.current.set(key, {
+                chatId,
+                msgId: state.assistantId,
+                text: event.text,
+              });
+            }
+            // Schedule flush if not already pending
+            if (textDeltaRafRef.current === null) {
+              textDeltaRafRef.current = requestAnimationFrame(flushTextDeltas);
+            }
           }
           break;
         }
 
         case "text_done": {
+          // Flush any pending text deltas before marking done
+          flushTextDeltas();
           if (state.assistantId) {
             const msgId = state.assistantId;
             setChats((prev) =>
@@ -639,6 +718,8 @@ function HomeInner() {
         }
 
         case "interrupted": {
+          // Flush any pending text deltas before handling interrupt
+          flushTextDeltas();
           // Current turn was interrupted by a mid-stream user message.
           // Mark any streaming assistant message as done.
           if (state.assistantId) {
@@ -666,6 +747,8 @@ function HomeInner() {
         }
 
         case "tool_use_start": {
+          // Flush any pending text deltas before tool use
+          flushTextDeltas();
           if (state.assistantId) {
             const msgId = state.assistantId;
             setChats((prev) =>
@@ -919,7 +1002,7 @@ function HomeInner() {
         }
       }
     };
-  }, [sendDesktopNotification, addToast]);
+  }, [sendDesktopNotification, addToast, flushTextDeltas]);
 
   // =========================================
   // Send Message

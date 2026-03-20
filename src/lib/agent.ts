@@ -774,6 +774,8 @@ export class AgentSession {
   private inputQueue: SDKUserMessage[] = [];
   private inputResolvers: Array<() => void> = [];
   private interrupted = false;
+  // Track whether a tool is currently executing (tool_use started, no tool_result yet)
+  private _isToolRunning = false;
 
   /**
    * Whether this session's query has finished (result received or closed).
@@ -783,11 +785,32 @@ export class AgentSession {
   }
 
   /**
+   * Whether a tool is currently executing.
+   * Interrupting during tool execution causes ede_diagnostic errors
+   * because the conversation ends up with tool_use but no tool_result.
+   */
+  get isToolRunning(): boolean {
+    return this._isToolRunning;
+  }
+
+  /**
    * Inject a user message mid-stream. Interrupts the current turn,
    * then feeds the message into the running query.
+   *
+   * Returns false if injection is not safe right now (e.g., tool is running).
+   * The frontend should fall back to queueing in that case.
    */
   async injectMessage(text: string, images?: string[]): Promise<boolean> {
     if (this.closed || !this.queryInstance || !this.sessionId) {
+      return false;
+    }
+
+    // SAFETY: Do NOT interrupt during tool execution.
+    // Calling interrupt() while a tool_use is pending (no tool_result yet)
+    // creates an invalid conversation state and crashes the SDK with
+    // ede_diagnostic: result_type=user last_content_type=n/a stop_reason=tool_use
+    if (this._isToolRunning) {
+      console.log(`[agent-session] Rejecting injection — tool is running. Frontend should queue instead.`);
       return false;
     }
 
@@ -805,13 +828,14 @@ export class AgentSession {
       session_id: this.sessionId,
     };
 
-    // Interrupt current turn first
+    // Interrupt current turn first (safe — only called during text generation)
     try {
       this.interrupted = true;
       await this.queryInstance.interrupt();
       console.log(`[agent-session] Interrupted current turn for injection`);
     } catch (err) {
       console.log(`[agent-session] interrupt() failed (may already be idle): ${err}`);
+      // If interrupt failed, still try to push (might be between turns)
     }
 
     // Push message to the async input stream
@@ -1014,6 +1038,7 @@ export class AgentSession {
         if (msg.type === "system" && msg.subtype === "interrupt") {
           console.log(`[agent-session] Turn interrupted for user injection`);
           this.interrupted = false;
+          this._isToolRunning = false; // Reset tool state on interrupt
           yield { type: "interrupted" };
           // Reset streaming state for new turn
           if (isStreamingText) {
@@ -1074,14 +1099,17 @@ export class AgentSession {
                   exitPlanModeDetected = true;
                   exitPlanModeBlockIndex = event.index;
                   exitPlanModeToolUseId = block.id;
+                  this._isToolRunning = true; // Mark tool as running
                   break;
                 }
                 if (block.name === "AskUserQuestion") {
                   askUserDetected = true;
                   askUserBlockIndex = event.index;
                   askUserToolUseId = block.id;
+                  this._isToolRunning = true; // Mark tool as running
                   break;
                 }
+                this._isToolRunning = true; // Mark tool as running
                 toolUseBlockMap.set(event.index, { toolUseId: block.id, toolName: block.name });
                 yield { type: "tool_use_start", toolName: block.name, toolUseId: block.id };
               }
@@ -1178,12 +1206,15 @@ export class AgentSession {
           }
           turnCount++;
           toolUseBlockMap.clear();
+          this._isToolRunning = false; // Turn complete — safe to inject
           if (!exitPlanModeDetected && !askUserDetected && !planModeActive) currentAssistantText = "";
           yield { type: "turn_done", inputTokens: turnInputTokens, outputTokens: turnOutputTokens };
           continue;
         }
 
         if (msg.type === "user") {
+          // Tool results received — tool execution is complete, safe to inject again
+          this._isToolRunning = false;
           const content = msg.message?.content || msg.content;
           if (Array.isArray(content)) {
             for (const block of content) {

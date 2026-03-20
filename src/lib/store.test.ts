@@ -60,6 +60,9 @@ function makeChat(overrides?: Partial<Chat>): Chat {
     settings: { systemPrompt: "", maxTurns: 0, maxBudgetUsd: 0 },
     costUsd: 0,
     durationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    turnCount: 0,
     ...overrides,
   };
 }
