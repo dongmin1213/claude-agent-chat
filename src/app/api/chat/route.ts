@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { runAgent } from "@/lib/agent";
+import { runAgent, AgentSession } from "@/lib/agent";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -14,9 +14,15 @@ delete process.env.CLAUDECODE;
 // ── Active stream tracking for abort support ──
 // Maps streamId → AbortController so abort endpoint can signal cancellation
 const activeStreams = new Map<string, AbortController>();
+// Maps streamId → AgentSession for mid-stream message injection
+const activeSessions = new Map<string, AgentSession>();
 
 export function getActiveStreams() {
   return activeStreams;
+}
+
+export function getActiveSessions() {
+  return activeSessions;
 }
 
 let streamIdCounter = 0;
@@ -121,7 +127,10 @@ export async function POST(request: NextRequest) {
         const initEvent = { type: "stream_init", streamId };
         controller.enqueue(encoder.encode(JSON.stringify(initEvent) + "\n"));
 
-        const agentStream = runAgent({
+        const session = new AgentSession();
+        activeSessions.set(streamId, session);
+
+        const agentStream = session.run({
           prompt,
           sessionId: sessionId || undefined,
           model: model || undefined,
@@ -180,6 +189,8 @@ export async function POST(request: NextRequest) {
       } finally {
         // Clean up
         activeStreams.delete(streamId);
+        const sess = activeSessions.get(streamId);
+        if (sess) { sess.close(); activeSessions.delete(streamId); }
         if (requestSignal) {
           requestSignal.removeEventListener("abort", onRequestAbort);
         }

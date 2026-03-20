@@ -10,6 +10,13 @@ const DEV_MODE = process.argv.includes("--dev");
 const DEV_PORT = 13370; // Must match the port in electron:dev script
 const STATE_FILE = path.join(app.getPath("userData"), "window-state.json");
 
+// ── Memory optimization flags ──────────────────────────
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=256");
+app.commandLine.appendSwitch("disable-gpu-compositing");
+// Reduce renderer memory overhead
+app.commandLine.appendSwitch("disable-software-rasterizer");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+
 const ZOOM_STEP = 0.1;
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 2.0;
@@ -253,6 +260,8 @@ function createWindow(port) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: true,
+      spellcheck: false,
     },
   });
 
@@ -287,6 +296,11 @@ function createWindow(port) {
       e.preventDefault();
       mainWindow.hide();
     }
+  });
+
+  // Free memory when hidden, reclaim when shown
+  mainWindow.on("hide", () => {
+    try { mainWindow.webContents.session.clearCache(); } catch {}
   });
 
   mainWindow.on("closed", () => {
@@ -334,6 +348,8 @@ function createChatWindow(chatId) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: true,
+      spellcheck: false,
     },
   });
 

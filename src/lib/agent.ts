@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { execSync } from "child_process";
@@ -759,6 +760,542 @@ export async function* runAgent(
       type: "error",
       message: classifyAgentError(err),
     };
+  }
+}
+
+// =========================================
+// AgentSession — wraps Query for mid-stream message injection
+// =========================================
+
+export class AgentSession {
+  private queryInstance: Query | null = null;
+  private sessionId: string = "";
+  private closed = false;
+  private inputQueue: SDKUserMessage[] = [];
+  private inputResolvers: Array<() => void> = [];
+  private interrupted = false;
+
+  /**
+   * Whether this session's query has finished (result received or closed).
+   */
+  get isFinished(): boolean {
+    return this.closed;
+  }
+
+  /**
+   * Inject a user message mid-stream. Interrupts the current turn,
+   * then feeds the message into the running query.
+   */
+  async injectMessage(text: string, images?: string[]): Promise<boolean> {
+    if (this.closed || !this.queryInstance || !this.sessionId) {
+      return false;
+    }
+
+    // Build prompt with images if provided
+    let prompt = text;
+    if (images && images.length > 0) {
+      const imageRefs = images.map((p) => `[Attached Image: ${p}]`).join("\n");
+      prompt = prompt ? `${imageRefs}\n\n${prompt}` : `${imageRefs}\n\nPlease analyze these images.`;
+    }
+
+    const userMessage: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: prompt },
+      parent_tool_use_id: null,
+      session_id: this.sessionId,
+    };
+
+    // Interrupt current turn first
+    try {
+      this.interrupted = true;
+      await this.queryInstance.interrupt();
+      console.log(`[agent-session] Interrupted current turn for injection`);
+    } catch (err) {
+      console.log(`[agent-session] interrupt() failed (may already be idle): ${err}`);
+    }
+
+    // Push message to the async input stream
+    this.inputQueue.push(userMessage);
+    // Wake up the waiting generator
+    const resolver = this.inputResolvers.shift();
+    if (resolver) resolver();
+
+    return true;
+  }
+
+  /**
+   * Create the async iterable that feeds user messages into the query.
+   */
+  private async *createInputStream(): AsyncGenerator<SDKUserMessage> {
+    while (!this.closed) {
+      if (this.inputQueue.length > 0) {
+        yield this.inputQueue.shift()!;
+      } else {
+        // Wait for next push or close
+        await new Promise<void>((resolve) => {
+          this.inputResolvers.push(resolve);
+        });
+      }
+    }
+  }
+
+  /**
+   * Close the session — terminate input stream and query.
+   */
+  close(): void {
+    this.closed = true;
+    // Wake up all waiting promises so the input generator can exit
+    for (const resolver of this.inputResolvers) {
+      resolver();
+    }
+    this.inputResolvers = [];
+    if (this.queryInstance) {
+      try { this.queryInstance.close(); } catch { /* ignore */ }
+      this.queryInstance = null;
+    }
+  }
+
+  /**
+   * Run the agent. Same logic as runAgent but stores the Query instance
+   * and connects the streamInput for mid-stream injection.
+   */
+  async *run(
+    params: AgentQueryParams & { signal?: AbortSignal }
+  ): AsyncGenerator<StreamEvent> {
+    // Re-use all the existing runAgent logic, but with Query stored
+    // and streamInput connected.
+    delete process.env.CLAUDECODE;
+
+    const { prompt, sessionId, cwd, model, systemPrompt, maxTurns, maxBudgetUsd, mcpServers, signal } = params;
+
+    const baseTools = [
+      "Read", "Edit", "Write", "Bash", "Glob", "Grep",
+      "WebSearch", "WebFetch", "Task", "ExitPlanMode",
+    ];
+    if (mcpServers && mcpServers.length > 0) {
+      for (const server of mcpServers.filter((s) => s.enabled)) {
+        baseTools.push(`mcp__${server.name}`);
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const options: Record<string, any> = {
+      allowedTools: baseTools,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      includePartialMessages: true,
+      stderr: (data: string) => { console.log(`[agent:stderr] ${data.trimEnd()}`); },
+    };
+
+    if (sessionId) options.resume = sessionId;
+    if (cwd) options.cwd = cwd;
+    if (model) {
+      const modelMap: Record<string, string> = {
+        sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-6", haiku: "claude-haiku-4-5",
+      };
+      options.model = modelMap[model] || model;
+    }
+    if (systemPrompt) options.systemPrompt = systemPrompt;
+    if (maxTurns && maxTurns > 0) options.maxTurns = maxTurns;
+    if (maxBudgetUsd && maxBudgetUsd > 0) options.maxBudgetUsd = maxBudgetUsd;
+    if (mcpServers && mcpServers.length > 0) {
+      const enabledServers = mcpServers.filter((s) => s.enabled);
+      if (enabledServers.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const mcpConfig: Record<string, any> = {};
+        for (const server of enabledServers) {
+          if (server.type === "sse" && server.url) {
+            mcpConfig[server.name] = { type: "sse", url: server.url };
+          } else if (server.command) {
+            mcpConfig[server.name] = { type: "stdio", command: server.command, args: server.args || [] };
+          }
+        }
+        if (Object.keys(mcpConfig).length > 0) {
+          options.mcpServers = mcpConfig;
+          options.strictMcpConfig = false;
+        }
+      }
+    }
+    if (signal) options.abortSignal = signal;
+
+    let isStreamingText = false;
+    const toolUseBlockMap = new Map<number, { toolUseId: string; toolName: string }>();
+    let currentAssistantText = "";
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let turnInputTokens = 0;
+    let turnOutputTokens = 0;
+    let turnCount = 0;
+    let planModeActive = false;
+    let planFileContent = "";
+    let exitPlanModeDetected = false;
+    let exitPlanModeBlockIndex = -1;
+    let exitPlanModeToolUseId = "";
+    let exitPlanModeInputBuffer = "";
+    let askUserDetected = false;
+    let askUserBlockIndex = -1;
+    let askUserToolUseId = "";
+    let askUserInputBuffer = "";
+
+    try {
+      const serverPid = process.pid;
+      const preExistingPids = new Set<number>();
+      try {
+        const out = execSync(
+          `wmic process where "ParentProcessId=${serverPid}" get ProcessId /format:list`,
+          { encoding: "utf-8", timeout: 3000 }
+        );
+        for (const line of out.split("\n")) {
+          const match = line.match(/ProcessId=(\d+)/);
+          if (match) preExistingPids.add(parseInt(match[1], 10));
+        }
+      } catch { /* ignore */ }
+
+      const cliPath = resolveClaudeCliPath();
+      if (cliPath) {
+        options.pathToClaudeCodeExecutable = cliPath;
+        console.log(`[agent-session] Using Claude CLI at: ${cliPath}`);
+      }
+
+      // Create the query — store reference for injection
+      const queryIterable = query({ prompt, options });
+      this.queryInstance = queryIterable;
+
+      // Connect the streamInput for mid-stream message injection
+      // (fire-and-forget — it runs alongside the main iteration)
+      queryIterable.streamInput(this.createInputStream()).catch((err) => {
+        if (!this.closed) {
+          console.log(`[agent-session] streamInput ended: ${err}`);
+        }
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const iterator = (queryIterable as any)[Symbol.asyncIterator]();
+
+      if (signal) {
+        setTimeout(() => {
+          const newPids = captureNewChildPids(serverPid, preExistingPids);
+          if (newPids.size > 0) {
+            activeAgentPids.set(signal, newPids);
+            console.log(`[agent-session] Tracked SDK subprocess PIDs: ${[...newPids].join(", ")}`);
+          }
+        }, 2000);
+      }
+
+      const ABORT_SENTINEL = Symbol("abort");
+      const abortPromise = signal
+        ? new Promise<typeof ABORT_SENTINEL>((resolve) => {
+            if (signal.aborted) { resolve(ABORT_SENTINEL); return; }
+            signal.addEventListener("abort", () => resolve(ABORT_SENTINEL), { once: true });
+          })
+        : null;
+
+      try {
+      while (true) {
+        const nextPromise = iterator.next();
+        const raceResult = abortPromise
+          ? await Promise.race([nextPromise, abortPromise])
+          : await nextPromise;
+
+        if (raceResult === ABORT_SENTINEL || signal?.aborted) {
+          console.log(`[agent-session] Abort signal received`);
+          if (signal) forceCleanupAgentProcesses(signal);
+          yield { type: "status", message: "Aborted by user" };
+          return;
+        }
+
+        const iterResult = raceResult as IteratorResult<unknown>;
+        if (iterResult.done) break;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const msg = iterResult.value as any;
+
+        // Handle interrupt system message — yield "interrupted" event
+        if (msg.type === "system" && msg.subtype === "interrupt") {
+          console.log(`[agent-session] Turn interrupted for user injection`);
+          this.interrupted = false;
+          yield { type: "interrupted" };
+          // Reset streaming state for new turn
+          if (isStreamingText) {
+            isStreamingText = false;
+          }
+          continue;
+        }
+
+        // ── From here, same logic as original runAgent ──
+
+        if (msg.type === "auth_status") {
+          if (msg.error) {
+            yield { type: "error", message: `Authentication error: ${msg.error}` };
+          } else if (msg.isAuthenticating) {
+            yield { type: "status", message: "Authenticating..." };
+          }
+          continue;
+        }
+
+        if (msg.type === "system") {
+          if (msg.subtype === "init") {
+            this.sessionId = msg.session_id;
+            yield { type: "session_init", sessionId: msg.session_id };
+          } else if (msg.subtype === "status") {
+            yield { type: "status", message: String(msg.status || "Processing...") };
+          } else if (msg.subtype === "compact_boundary") {
+            yield { type: "status", message: "Compacting conversation context..." };
+          } else if (msg.subtype === "task_notification") {
+            const taskStatus = msg.status === "completed" ? "✓" : msg.status === "failed" ? "✗" : msg.status === "stopped" ? "⊘" : "○";
+            yield { type: "status", message: `Task ${taskStatus}: ${msg.summary || msg.task_id}` };
+          } else if (
+            msg.subtype === "task_started" || msg.subtype === "task_progress" ||
+            msg.subtype === "files_persisted" || msg.subtype === "elicitation_complete" ||
+            msg.subtype === "hook_started" || msg.subtype === "hook_progress" || msg.subtype === "hook_response" ||
+            msg.subtype === "local_command_output"
+          ) {
+            // silently skip
+          } else {
+            yield { type: "status", message: String(msg.subtype || msg.message || msg.description || "Processing...") };
+          }
+          continue;
+        }
+
+        if (msg.type === "tool_progress") continue;
+        if (msg.type === "tool_use_summary" || msg.type === "prompt_suggestion" || msg.type === "rate_limit_event") continue;
+
+        if (msg.type === "stream_event") {
+          const event = msg.event;
+          if (!event) continue;
+          switch (event.type) {
+            case "content_block_start": {
+              const block = event.content_block;
+              if (block?.type === "text") {
+                isStreamingText = true;
+              } else if (block?.type === "tool_use") {
+                if (block.name === "EnterPlanMode") planModeActive = true;
+                if (block.name === "ExitPlanMode") {
+                  exitPlanModeDetected = true;
+                  exitPlanModeBlockIndex = event.index;
+                  exitPlanModeToolUseId = block.id;
+                  break;
+                }
+                if (block.name === "AskUserQuestion") {
+                  askUserDetected = true;
+                  askUserBlockIndex = event.index;
+                  askUserToolUseId = block.id;
+                  break;
+                }
+                toolUseBlockMap.set(event.index, { toolUseId: block.id, toolName: block.name });
+                yield { type: "tool_use_start", toolName: block.name, toolUseId: block.id };
+              }
+              break;
+            }
+            case "content_block_delta": {
+              const delta = event.delta;
+              if (delta?.type === "text_delta" && delta.text) {
+                currentAssistantText += delta.text;
+                if (!planModeActive) yield { type: "text_delta", text: delta.text };
+              } else if (delta?.type === "input_json_delta" && delta.partial_json) {
+                if (exitPlanModeDetected && event.index === exitPlanModeBlockIndex) {
+                  exitPlanModeInputBuffer += delta.partial_json;
+                  break;
+                }
+                if (askUserDetected && event.index === askUserBlockIndex) {
+                  askUserInputBuffer += delta.partial_json;
+                  break;
+                }
+                yield { type: "tool_use_input_delta", partialJson: delta.partial_json };
+              }
+              break;
+            }
+            case "content_block_stop": {
+              if (isStreamingText) {
+                if (!planModeActive) yield { type: "text_done" };
+                isStreamingText = false;
+              }
+              break;
+            }
+          }
+          continue;
+        }
+
+        if (msg.type === "assistant") {
+          if (msg.error) {
+            const errorMap: Record<string, string> = {
+              authentication_failed: "Authentication failed. Run 'claude' to re-authenticate.",
+              billing_error: "Billing error. Check your Claude subscription or API billing.",
+              rate_limit: "Rate limited. Please wait a moment and try again.",
+              invalid_request: "Invalid request sent to API.",
+              server_error: "Claude API server error. Please try again.",
+              max_output_tokens: "Response exceeded maximum output tokens.",
+              unknown: "Unknown API error occurred.",
+            };
+            yield { type: "error", message: errorMap[msg.error] || `API error: ${msg.error}` };
+          }
+          const content = msg.message?.content || msg.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === "text" && block.text) {
+                if (!isStreamingText && toolUseBlockMap.size === 0) {
+                  yield { type: "text_delta", text: block.text };
+                  yield { type: "text_done" };
+                }
+              } else if (block.type === "tool_use") {
+                if (!planModeActive && block.name === "EnterPlanMode") planModeActive = true;
+                if (!exitPlanModeDetected && block.name === "ExitPlanMode") {
+                  exitPlanModeDetected = true;
+                  exitPlanModeToolUseId = block.id;
+                  if (block.input) exitPlanModeInputBuffer = JSON.stringify(block.input);
+                  continue;
+                }
+                if (!askUserDetected && block.name === "AskUserQuestion") {
+                  askUserDetected = true;
+                  askUserToolUseId = block.id;
+                  if (block.input) askUserInputBuffer = JSON.stringify(block.input);
+                  continue;
+                }
+                if (exitPlanModeDetected && block.id === exitPlanModeToolUseId) continue;
+                if (askUserDetected && block.id === askUserToolUseId) continue;
+                if (planModeActive && block.name === "Write") {
+                  const writeContent = block.input?.content || block.input?.file_content || block.input?.text;
+                  if (writeContent && typeof writeContent === "string" && writeContent.length > planFileContent.length) {
+                    planFileContent = writeContent;
+                  }
+                }
+                const tracked = toolUseBlockMap.get(content.indexOf(block));
+                if (tracked) {
+                  yield { type: "tool_use_done", toolUseId: tracked.toolUseId, input: block.input || {} };
+                } else {
+                  yield { type: "tool_use_start", toolName: block.name, toolUseId: block.id };
+                  yield { type: "tool_use_done", toolUseId: block.id, input: block.input || {} };
+                }
+              }
+            }
+          }
+          const usage = msg.message?.usage;
+          if (usage) {
+            turnInputTokens = usage.input_tokens || 0;
+            turnOutputTokens = usage.output_tokens || 0;
+            totalInputTokens += turnInputTokens;
+            totalOutputTokens += turnOutputTokens;
+          }
+          turnCount++;
+          toolUseBlockMap.clear();
+          if (!exitPlanModeDetected && !askUserDetected && !planModeActive) currentAssistantText = "";
+          yield { type: "turn_done", inputTokens: turnInputTokens, outputTokens: turnOutputTokens };
+          continue;
+        }
+
+        if (msg.type === "user") {
+          const content = msg.message?.content || msg.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === "tool_result") {
+                if (exitPlanModeDetected && block.tool_use_id === exitPlanModeToolUseId) {
+                  if (!planFileContent) {
+                    const resultText = Array.isArray(block.content)
+                      ? block.content.map((c: { text?: string }) => c.text || "").join("\n")
+                      : typeof block.content === "string" ? block.content : "";
+                    if (resultText && resultText.trim()) planFileContent = resultText;
+                  }
+                  continue;
+                }
+                if (askUserDetected && block.tool_use_id === askUserToolUseId) continue;
+                const resultText = Array.isArray(block.content)
+                  ? block.content.filter((c: { type?: string }) => c.type === "text" || !c.type).map((c: { text?: string }) => c.text || "").join("\n")
+                  : typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+                const images: string[] = [];
+                if (Array.isArray(block.content)) {
+                  for (const c of block.content) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const cb = c as any;
+                    if (cb.type === "image") {
+                      if (cb.source?.type === "base64" && cb.source.data) {
+                        images.push(`data:${cb.source.media_type || "image/png"};base64,${cb.source.data}`);
+                      } else if (cb.data && typeof cb.data === "string") {
+                        images.push(`data:${cb.mimeType || "image/png"};base64,${cb.data}`);
+                      }
+                    }
+                  }
+                  if (block.content.length > 0) {
+                    const types = block.content.map((c: { type?: string }) => c.type).join(",");
+                    console.log(`[agent] tool_result content types: [${types}], images found: ${images.length}`);
+                  }
+                }
+                yield {
+                  type: "tool_result",
+                  toolUseId: block.tool_use_id,
+                  content: resultText,
+                  isError: block.is_error === true,
+                  ...(images.length > 0 ? { images } : {}),
+                };
+              }
+            }
+          }
+          if (exitPlanModeDetected) {
+            let allowedPrompts: { tool: string; prompt: string }[] | undefined;
+            try {
+              const parsed = JSON.parse(exitPlanModeInputBuffer);
+              if (parsed.allowedPrompts && Array.isArray(parsed.allowedPrompts)) allowedPrompts = parsed.allowedPrompts;
+            } catch { /* ignore */ }
+            let resolvedPlanContent = planFileContent || undefined;
+            if (!resolvedPlanContent && cwd) {
+              for (const planPath of [join(cwd, ".claude", "plan.md"), join(cwd, ".claude", "plan"), join(cwd, "plan.md"), join(cwd, "PLAN.md")]) {
+                try {
+                  const fileContent = await readFile(planPath, "utf-8");
+                  if (fileContent?.trim()) { resolvedPlanContent = fileContent; break; }
+                } catch { /* try next */ }
+              }
+            }
+            if (!resolvedPlanContent && currentAssistantText?.trim()) resolvedPlanContent = currentAssistantText;
+            yield { type: "plan_approval", allowedPrompts, planContent: resolvedPlanContent };
+            return;
+          }
+          if (askUserDetected) {
+            let questions: { question: string; header: string; options: { label: string; description: string }[]; multiSelect: boolean }[] = [];
+            try {
+              const parsed = JSON.parse(askUserInputBuffer);
+              if (parsed.questions && Array.isArray(parsed.questions)) questions = parsed.questions;
+            } catch { /* ignore */ }
+            yield { type: "ask_user", questions };
+            return;
+          }
+          continue;
+        }
+
+        if (msg.type === "result") {
+          if (msg.subtype === "success") {
+            yield { type: "result", result: msg.result || "", costUsd: msg.total_cost_usd, durationMs: msg.duration_ms, inputTokens: totalInputTokens, outputTokens: totalOutputTokens, turnCount };
+          } else {
+            const errorLabels: Record<string, string> = {
+              error_during_execution: "Error during execution",
+              error_max_turns: "Maximum turns reached",
+              error_max_budget_usd: "Budget limit exceeded",
+              error_max_structured_output_retries: "Structured output retries exceeded",
+            };
+            const label = errorLabels[msg.subtype] || msg.subtype;
+            yield { type: "error", message: `${label}${msg.errors?.length > 0 ? ": " + msg.errors.join(", ") : ""}` };
+            yield { type: "result", result: "", costUsd: msg.total_cost_usd, durationMs: msg.duration_ms, inputTokens: totalInputTokens, outputTokens: totalOutputTokens, turnCount };
+          }
+          return;
+        }
+
+        console.log(`[agent-session] Unhandled message type: ${msg.type}`, msg.subtype || "");
+      }
+      } finally {
+        try { await iterator.return?.(); } catch { /* ignore */ }
+        if (signal) setTimeout(() => forceCleanupAgentProcesses(signal), 500);
+      }
+    } catch (err) {
+      if (signal?.aborted) {
+        if (signal) forceCleanupAgentProcesses(signal);
+        return;
+      }
+      if (signal) forceCleanupAgentProcesses(signal);
+      yield { type: "error", message: classifyAgentError(err) };
+    } finally {
+      this.closed = true;
+      // Clean up input stream
+      for (const resolver of this.inputResolvers) resolver();
+      this.inputResolvers = [];
+    }
   }
 }
 

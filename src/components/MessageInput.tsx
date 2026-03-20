@@ -162,7 +162,7 @@ export default function MessageInput({
           return;
         }
       }
-      if (!isLoading && (trimmed || attachments.length > 0)) onSend();
+      if (trimmed || attachments.length > 0) onSend();
     }
   };
 
@@ -382,7 +382,6 @@ export default function MessageInput({
             onClick={() => fileInputRef.current?.click()}
             className="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-hover transition-colors"
             title="Attach file"
-            disabled={isLoading}
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M13.5 7.5l-5.793 5.793a3 3 0 01-4.243 0v0a3 3 0 010-4.243L9.88 2.636a2 2 0 012.828 0v0a2 2 0 010 2.828L6.293 11.88a1 1 0 01-1.414 0v0a1 1 0 010-1.414L10.5 4.843" />
@@ -406,10 +405,9 @@ export default function MessageInput({
             placeholder={isDragging ? "Drop files here..." : "Send a message... (paste images with Ctrl+V)"}
             rows={1}
             className="flex-1 min-w-0 bg-transparent text-text-primary placeholder-text-muted text-sm resize-none outline-none px-2 py-1.5 max-h-[200px] overflow-y-auto overflow-x-hidden break-words [overflow-wrap:break-word] [word-break:break-word]"
-            disabled={isLoading}
           />
 
-          {isLoading ? (
+          {isLoading && !value.trim() && attachments.length === 0 ? (
             <button
               onClick={onStop}
               className="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-lg bg-error/20 text-error hover:bg-error/30 transition-colors"

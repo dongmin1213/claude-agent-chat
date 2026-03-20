@@ -346,6 +346,8 @@ function HomeInner() {
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   // Track backend stream IDs for abort endpoint (chatId → streamId)
   const streamIdsRef = useRef<Map<string, string>>(new Map());
+  // Queue messages sent while AI is streaming — auto-sent after stream completes
+  const pendingMessagesRef = useRef<Map<string, { fullMessage: string; displayText: string; images?: string[] }[]>>(new Map());
   const activeChatIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -636,6 +638,33 @@ function HomeInner() {
           break;
         }
 
+        case "interrupted": {
+          // Current turn was interrupted by a mid-stream user message.
+          // Mark any streaming assistant message as done.
+          if (state.assistantId) {
+            const msgId = state.assistantId;
+            setChats((prev) =>
+              updateMessageInChat(prev, chatId, msgId, (msg) => ({
+                ...msg,
+                isStreaming: false,
+              }))
+            );
+            state.assistantId = null;
+          }
+          // Mark any running tool as stopped
+          if (state.toolUseId) {
+            const toolId = state.toolUseId;
+            setChats((prev) =>
+              updateMessageInChat(prev, chatId, toolId, (msg) => ({
+                ...msg,
+                isRunning: false,
+              }))
+            );
+            state.toolUseId = null;
+          }
+          break;
+        }
+
         case "tool_use_start": {
           if (state.assistantId) {
             const msgId = state.assistantId;
@@ -906,8 +935,41 @@ function HomeInner() {
       activeChatIdRef.current = chatId;
     }
 
-    // Don't send if THIS chat is already loading
-    if (abortControllersRef.current.has(chatId)) return;
+    // If this chat is already streaming, inject the message mid-stream
+    if (abortControllersRef.current.has(chatId)) {
+      const userMsg: UIMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: displayText,
+        timestamp: Date.now(),
+        ...(images && images.length > 0 ? { images } : {}),
+      };
+      setChats((prev) => addMessageToChat(prev, chatId!, userMsg));
+
+      // Try mid-stream injection via /api/chat/inject
+      const streamId = streamIdsRef.current.get(chatId);
+      if (streamId) {
+        try {
+          const res = await fetch("/api/chat/inject", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ streamId, message: fullMessage, images }),
+          });
+          if (res.ok) {
+            console.log(`[inject] Message injected mid-stream for ${chatId}`);
+            return;
+          }
+        } catch (err) {
+          console.log(`[inject] Failed, falling back to queue:`, err);
+        }
+      }
+
+      // Fallback: queue for after stream completes
+      const queue = pendingMessagesRef.current.get(chatId) || [];
+      queue.push({ fullMessage, displayText, images });
+      pendingMessagesRef.current.set(chatId, queue);
+      return;
+    }
 
     const userMsg: UIMessage = {
       id: crypto.randomUUID(),
@@ -979,6 +1041,15 @@ function HomeInner() {
       setStatusMessages((prev) => { const next = new Map(prev); next.delete(chatId!); return next; });
       loadingStartTimesRef.current.delete(chatId!);
       streamStateRef.current.delete(chatId!);
+
+      // Process queued messages (sent while AI was streaming)
+      const queue = pendingMessagesRef.current.get(chatId!);
+      if (queue && queue.length > 0) {
+        const next = queue.shift()!;
+        if (queue.length === 0) pendingMessagesRef.current.delete(chatId!);
+        // Small delay so UI updates before next stream starts
+        setTimeout(() => doSend(next.fullMessage, next.displayText, next.images), 150);
+      }
     }
   }, [createStreamHandler, defaultCwd, appSettings]);
 
@@ -1054,6 +1125,9 @@ function HomeInner() {
     // 3. Clean up UI state
     setLoadingChatIds((prev) => { const next = new Set(prev); next.delete(chatId); return next; });
     streamStateRef.current.delete(chatId);
+
+    // 4. Clear pending message queue (user explicitly stopped)
+    pendingMessagesRef.current.delete(chatId);
   }, []);
 
   // Edit user message: truncate messages after it, re-send with new content

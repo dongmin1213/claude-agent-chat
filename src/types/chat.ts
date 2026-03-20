@@ -241,5 +241,6 @@ export type StreamEvent =
   | { type: "plan_approval"; allowedPrompts?: { tool: string; prompt: string }[]; planContent?: string }
   | { type: "ask_user"; questions: AskUserQuestion[] }
   | { type: "result"; result: string; costUsd?: number; durationMs?: number; inputTokens?: number; outputTokens?: number; turnCount?: number }
+  | { type: "interrupted" }
   | { type: "status"; message: string }
   | { type: "error"; message: string };

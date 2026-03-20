@@ -28,16 +28,16 @@ export function loadChats(): Chat[] {
   }
 }
 
-/** Returns true if saved OK, false if quota exceeded (fallback used or failed entirely). */
-export function saveChats(chats: Chat[]): boolean {
-  if (typeof window === "undefined") return true;
-  // Strip any remaining base64 data URLs from images to prevent localStorage overflow
-  const sanitized = chats.map((chat) => ({
+/**
+ * Sanitize a chat: strip base64 data URLs from images, keep only file paths.
+ * Prevents localStorage overflow.
+ */
+function sanitizeChat(chat: Chat): Chat {
+  return {
     ...chat,
     messages: chat.messages.map((msg) => {
       const images = (msg as { images?: string[] }).images;
       if (images && images.some((s) => s.startsWith("data:"))) {
-        // Filter out base64 data URLs, keep only file paths
         const pathsOnly = images.filter((s) => !s.startsWith("data:"));
         if (pathsOnly.length > 0) {
           return { ...msg, images: pathsOnly };
@@ -48,25 +48,35 @@ export function saveChats(chats: Chat[]): boolean {
       }
       return msg;
     }),
-  }));
+  };
+}
+
+/** Strip ALL images from a chat (last-resort quota fallback). */
+function stripAllImages(chat: Chat): Chat {
+  return {
+    ...chat,
+    messages: chat.messages.map((msg) => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { images: _img, ...rest } = msg as unknown as Record<string, unknown>;
+      return rest as unknown as UIMessage;
+    }),
+  };
+}
+
+/** Returns true if saved OK, false if quota exceeded (fallback used or failed entirely). */
+export function saveChats(chats: Chat[]): boolean {
+  if (typeof window === "undefined") return true;
+  const sanitized = chats.map(sanitizeChat);
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
     return true;
   } catch {
     // localStorage quota exceeded — try saving without images at all
-    const noImages = sanitized.map((chat) => ({
-      ...chat,
-      messages: chat.messages.map((msg) => {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { images: _img, ...rest } = msg as unknown as Record<string, unknown>;
-        return rest as unknown as UIMessage;
-      }),
-    }));
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(noImages));
-      return false; // Saved but with degraded data
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized.map(stripAllImages)));
+      return false;
     } catch {
-      return false; // Complete failure
+      return false;
     }
   }
 }
@@ -80,23 +90,39 @@ export function saveSingleChat(chatId: string, chats: Chat[]): boolean {
   const updatedChat = chats.find((c) => c.id === chatId);
   if (!updatedChat) return true;
 
+  // Apply same sanitization as saveChats
+  const sanitized = sanitizeChat(updatedChat);
+
   try {
-    // Read the CURRENT full list from localStorage (not our stale state)
     const raw = localStorage.getItem(STORAGE_KEY);
     const current: Chat[] = raw ? JSON.parse(raw) : [];
 
-    // Replace only the target chat, keep everything else as-is
     const idx = current.findIndex((c) => c.id === chatId);
     if (idx >= 0) {
-      current[idx] = updatedChat;
+      current[idx] = sanitized;
     } else {
-      current.push(updatedChat);
+      current.push(sanitized);
     }
 
     localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
     return true;
   } catch {
-    return false;
+    // Quota exceeded — try without images for this chat
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const current: Chat[] = raw ? JSON.parse(raw) : [];
+      const idx = current.findIndex((c) => c.id === chatId);
+      const noImg = stripAllImages(sanitized);
+      if (idx >= 0) {
+        current[idx] = noImg;
+      } else {
+        current.push(noImg);
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+      return false;
+    } catch {
+      return false;
+    }
   }
 }
 
