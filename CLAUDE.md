@@ -48,8 +48,13 @@ Claude Agent SDK 기반 데스크톱 채팅 앱. 브라우저(Next.js)와 Electr
 ### 데이터 흐름
 ```
 User Input → POST /api/chat (NDJSON stream)
-           → agent.ts: runAgent() → SDK query() → AsyncGenerator<StreamEvent>
+           → agent.ts: AgentSession.run() → SDK query() + streamInput() → AsyncGenerator<StreamEvent>
            → Frontend: ReadableStream → React state
+
+Mid-stream injection:
+  User sends message while AI is working
+  → POST /api/chat/inject → AgentSession.injectMessage()
+  → query.interrupt() + streamInput() → AI reads mid-turn
 ```
 
 ## 디렉토리 구조
@@ -65,6 +70,7 @@ src/
 │   └── api/
 │       ├── chat/route.ts         # NDJSON 스트리밍 API
 │       ├── chat/abort/route.ts   # 스트리밍 중단
+│       ├── chat/inject/route.ts # 스트리밍 중 메시지 끼어들기
 │       ├── files/route.ts        # 디렉토리 목록
 │       ├── file-content/route.ts # 파일 내용
 │       ├── file-search/route.ts  # 파일 이름 검색
@@ -93,12 +99,12 @@ src/
 │   ├── PlanApprovalBlock.tsx  # Plan Mode 승인 UI
 │   ├── AskUserBlock.tsx    # 질문/응답 UI
 │   ├── FileSearchModal.tsx # Ctrl+P 파일 검색
-│   ├── FolderPicker.tsx    # 폴더 브라우저
+│   ├── FolderPicker.tsx    # 폴더 브라우저 (경로 직접 입력 지원)
 │   ├── ImageModal.tsx      # 이미지 확대 모달
 │   ├── ContextMenu.tsx     # 우클릭 메뉴
 │   └── Toast.tsx           # 토스트 알림
 ├── lib/
-│   ├── agent.ts            # SDK query() 래퍼 (에러 분류, Plan/AskUser 인터셉트)
+│   ├── agent.ts            # SDK query() 래퍼 + AgentSession 클래스 (mid-stream injection, Plan/AskUser)
 │   ├── store.ts            # localStorage CRUD (채팅 + 설정 + 안읽음/핀)
 │   ├── shiki.ts            # Shiki 하이라이터 싱글턴
 │   ├── slash-commands.ts   # 슬래시 커맨드 정의 + 파싱

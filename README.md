@@ -39,7 +39,8 @@ For the UX, I borrowed from **KakaoTalk** — a chat list on the left, pop-out w
 - **Pin chats** — Pin important conversations to the top
 - **Real-time streaming** — NDJSON-based token streaming
 - **Model selection** — Opus / Sonnet / Haiku per chat
-- **Working directory** — Set CWD per chat for project-scoped work
+- **Mid-stream injection** — Send messages while AI is working; it reads them mid-turn (like Claude Code CLI)
+- **Working directory** — Set CWD per chat, with direct path input
 - **File explorer** — Tree view + syntax-highlighted preview + git status
 - **Terminal** — Built-in terminal with xterm.js + node-pty (multi-tab)
 - **Code blocks** — Shiki syntax highlighting, copy, HTML/SVG preview

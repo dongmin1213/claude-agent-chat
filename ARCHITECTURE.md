@@ -44,9 +44,14 @@ http://localhost:3000 → 기존 단일 페이지 레이아웃
 ```
 User Input
   → POST /api/chat (message, sessionId, model, cwd, systemPrompt, maxTurns, mcpServers)
-  → agent.ts: runAgent() → SDK query() → AsyncGenerator<StreamEvent>
+  → agent.ts: AgentSession.run() → SDK query() + streamInput() → AsyncGenerator<StreamEvent>
   → API Route: NDJSON stream (Content-Type: application/x-ndjson)
   → Frontend: ReadableStream parsing → React state updates
+
+Mid-stream injection (user sends message while AI is working):
+  → POST /api/chat/inject (streamId, message)
+  → AgentSession.injectMessage() → query.interrupt() + streamInput()
+  → AI reads new message mid-turn and responds
 ```
 
 ## API 엔드포인트
@@ -55,6 +60,7 @@ User Input
 |--------|----------|------|
 | POST | `/api/chat` | 채팅 스트리밍 (NDJSON) |
 | POST | `/api/chat/abort` | 스트리밍 중단 |
+| POST | `/api/chat/inject` | 스트리밍 중 메시지 끼어들기 |
 | GET | `/api/files?dir=` | 디렉토리 목록 |
 | GET | `/api/file-content?path=` | 파일 내용 + 언어 |
 | GET | `/api/file-search?dir=&q=` | 파일 이름 검색 |
@@ -81,6 +87,7 @@ type StreamEvent =
   | { type: "tool_use_done"; toolUseId: string; input: Record<string, unknown> }
   | { type: "tool_result"; toolUseId: string; content: string; isError: boolean }
   | { type: "turn_done" }
+  | { type: "interrupted" }
   | { type: "plan_approval"; allowedPrompts?; planContent? }
   | { type: "ask_user"; questions: AskUserQuestion[] }
   | { type: "result"; result: string; costUsd?; durationMs? }
