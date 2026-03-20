@@ -1,6 +1,6 @@
 {
   "name": "claude-agent-chat",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Desktop chat interface powered by Claude Agent SDK",
   "author": "Dongmin Kim",
   "private": false,

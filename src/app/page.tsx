@@ -1018,7 +1018,11 @@ function HomeInner() {
       activeChatIdRef.current = chatId;
     }
 
-    // If this chat is already streaming, inject the message mid-stream
+    // If this chat is already streaming, queue message for after completion
+    // NOTE: Mid-stream injection via interrupt() is disabled — the SDK's
+    // interrupt() crashes with ede_diagnostic when the model is about to
+    // call tools (stop_reason=tool_use). Queue approach is safer: message
+    // shows in chat immediately and auto-sends after current stream ends.
     if (abortControllersRef.current.has(chatId)) {
       const userMsg: UIMessage = {
         id: crypto.randomUUID(),
@@ -1029,25 +1033,7 @@ function HomeInner() {
       };
       setChats((prev) => addMessageToChat(prev, chatId!, userMsg));
 
-      // Try mid-stream injection via /api/chat/inject
-      const streamId = streamIdsRef.current.get(chatId);
-      if (streamId) {
-        try {
-          const res = await fetch("/api/chat/inject", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ streamId, message: fullMessage, images }),
-          });
-          if (res.ok) {
-            console.log(`[inject] Message injected mid-stream for ${chatId}`);
-            return;
-          }
-        } catch (err) {
-          console.log(`[inject] Failed, falling back to queue:`, err);
-        }
-      }
-
-      // Fallback: queue for after stream completes
+      // Queue for after stream completes
       const queue = pendingMessagesRef.current.get(chatId) || [];
       queue.push({ fullMessage, displayText, images });
       pendingMessagesRef.current.set(chatId, queue);
