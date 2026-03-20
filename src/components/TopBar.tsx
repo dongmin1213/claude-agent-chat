@@ -56,6 +56,7 @@ export default memo(function TopBar({
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const modelRef = useRef<HTMLDivElement>(null);
+  const cwdBtnRef = useRef<HTMLButtonElement>(null);
 
   const isElectron = typeof window !== "undefined" && !!window.electronAPI;
   const selectedModel = MODELS.find((m) => m.id === model) || MODELS[0];
@@ -136,6 +137,7 @@ export default memo(function TopBar({
         style={isElectron ? { WebkitAppRegion: "no-drag" } as React.CSSProperties : undefined}
       >
         <button
+          ref={cwdBtnRef}
           onClick={() => setFolderPickerOpen(!folderPickerOpen)}
           className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-xs text-text-secondary hover:text-text-primary transition-colors truncate max-w-[200px]"
           title={cwd}
@@ -153,6 +155,7 @@ export default memo(function TopBar({
             cwd={cwd}
             onSelect={onCwdChange}
             onClose={() => setFolderPickerOpen(false)}
+            anchorRef={cwdBtnRef}
           />
         )}
       </div>

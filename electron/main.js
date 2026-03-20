@@ -320,8 +320,8 @@ function createChatWindow(chatId) {
   const offset = (chatWindows.size % 5) * 30;
 
   const chatWin = new BrowserWindow({
-    width: 420,
-    height: Math.min(700, screenH),
+    width: 520,
+    height: Math.min(820, screenH),
     x: undefined,
     y: undefined,
     minWidth: 320,

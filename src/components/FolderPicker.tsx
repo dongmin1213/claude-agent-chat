@@ -17,11 +17,35 @@ interface FolderPickerProps {
 // Simple in-memory cache for directory listings
 const dirCache = new Map<string, FolderItem[]>();
 
-export default function FolderPicker({ cwd, onSelect, onClose }: FolderPickerProps) {
+export default function FolderPicker({ cwd, onSelect, onClose, anchorRef }: FolderPickerProps & { anchorRef?: React.RefObject<HTMLElement | null> }) {
   const [currentDir, setCurrentDir] = useState(cwd);
   const [items, setItems] = useState<FolderItem[]>(() => dirCache.get(cwd) || []);
   const [loading, setLoading] = useState(!dirCache.has(cwd));
+  const [pathInput, setPathInput] = useState(cwd);
+  const [pathError, setPathError] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Position the picker below the anchor button, clamped to viewport
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  useEffect(() => {
+    function update() {
+      const anchor = anchorRef?.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const pickerW = Math.min(384, window.innerWidth - 16);
+      let left = rect.left;
+      // Prevent right overflow
+      if (left + pickerW > window.innerWidth - 8) {
+        left = window.innerWidth - 8 - pickerW;
+      }
+      if (left < 8) left = 8;
+      setPos({ top: rect.bottom + 4, left });
+    }
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, [anchorRef]);
 
   const load = useCallback(async (dir: string) => {
     // Show cached data immediately if available
@@ -37,13 +61,23 @@ export default function FolderPicker({ cwd, onSelect, onClose }: FolderPickerPro
 
     try {
       const res = await fetch(`/api/files?dir=${encodeURIComponent(dir)}&dirsOnly=true`);
+      if (!res.ok) {
+        if (!cached) setItems([]);
+        setPathError(true);
+        setLoading(false);
+        return;
+      }
       const data = await res.json();
       const folders = data.items || [];
       dirCache.set(dir, folders);
       setItems(folders);
-      setCurrentDir(data.cwd || dir);
+      const resolvedDir = data.cwd || dir;
+      setCurrentDir(resolvedDir);
+      setPathInput(resolvedDir);
+      setPathError(false);
     } catch {
       if (!cached) setItems([]);
+      setPathError(true);
     }
     setLoading(false);
   }, []);
@@ -68,9 +102,40 @@ export default function FolderPicker({ cwd, onSelect, onClose }: FolderPickerPro
   const dirParts = currentDir.split(/[\\/]/).filter(Boolean);
 
   return (
-    <div ref={ref} className="absolute top-full left-0 mt-1 w-80 bg-bg-tertiary border border-border rounded-lg shadow-2xl z-50 overflow-hidden">
+    <div ref={ref} style={{ position: "fixed", top: pos?.top ?? 0, left: pos?.left ?? 0, width: Math.min(384, typeof window !== "undefined" ? window.innerWidth - 16 : 384) }} className={`bg-bg-tertiary border border-border rounded-lg shadow-2xl z-[9999] overflow-hidden${pos ? "" : " invisible"}`}>
+      {/* Path input */}
+      <div className="px-3 py-2 border-b border-border bg-bg-secondary/50">
+        <div className="flex items-center gap-1.5">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" className="flex-shrink-0 text-text-muted">
+            <path d="M1 3.5A1.5 1.5 0 012.5 2h3.879a1.5 1.5 0 011.06.44l1.122 1.12A1.5 1.5 0 009.62 4H13.5A1.5 1.5 0 0115 5.5v7a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 011 12.5v-9z" />
+          </svg>
+          <input
+            ref={inputRef}
+            type="text"
+            value={pathInput}
+            onChange={(e) => { setPathInput(e.target.value); setPathError(false); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                const trimmed = pathInput.trim();
+                if (trimmed) load(trimmed);
+              }
+            }}
+            className={`flex-1 bg-bg-primary border rounded px-2 py-1 text-[11px] text-text-primary outline-none transition-colors ${
+              pathError ? "border-red-500" : "border-border focus:border-accent"
+            }`}
+            placeholder="경로를 직접 입력하세요 (Enter)"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </div>
+        {pathError && (
+          <p className="text-[10px] text-red-400 mt-1 ml-[18px]">경로를 찾을 수 없습니다</p>
+        )}
+      </div>
+
       {/* Breadcrumb */}
-      <div className="flex items-center gap-0.5 px-3 py-2 border-b border-border bg-bg-secondary/50 overflow-x-auto">
+      <div className="flex items-center gap-0.5 px-3 py-1.5 border-b border-border overflow-x-auto">
         {dirParts.map((part, i) => {
           const fullPath = dirParts.slice(0, i + 1).join("\\");
           // On Windows, first part needs the backslash (e.g., "C:\")
